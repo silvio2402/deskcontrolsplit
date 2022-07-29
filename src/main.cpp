@@ -1,118 +1,73 @@
 #include <Arduino.h>
+#include "avr8-stub.h"
+#include "app_api.h" // only needed with flash breakpoints
 
-const unsigned long usbBaud = 115200;
 const unsigned long defaultControllerBaud = 9600;
 
-HardwareSerial *usbSerial = &Serial;
-HardwareSerial *controllerSerial = &Serial1;
-HardwareSerial *interfaceSerial = &Serial2;
+HardwareSerial *interfaceSerial = &Serial1;
+HardwareSerial *controllerSerial1 = &Serial2;
+HardwareSerial *controllerSerial2 = &Serial3;
 
-byte cmdBuffer[7];
-
-void setControllerBaud(unsigned long newControllerBaud)
+void initSerial(unsigned long newControllerBaud)
 {
-  (*controllerSerial).end();
+  (*controllerSerial1).end();
+  (*controllerSerial2).end();
   (*interfaceSerial).end();
-  (*controllerSerial).begin(newControllerBaud);
+
+  (*controllerSerial1).begin(newControllerBaud);
+  (*controllerSerial2).begin(newControllerBaud);
   (*interfaceSerial).begin(newControllerBaud);
 }
 
-void handleCmd_00(byte data[7])
+uint8_t *forwardSerial(HardwareSerial *inputSerial, HardwareSerial *outputSerial, int len)
 {
-  uint16_t height;
-  memcpy(&height, &data[3], 2);
-  height = (height >> 8) | (height << 8);
-  (*usbSerial).print("Set height: ");
-  (*usbSerial).println(height);
+  uint8_t *inputData = new uint8_t[len];
+
+  if (len <= 0)
+    return inputData;
+
+  (*inputSerial).readBytes(inputData, len);
+
+  (*outputSerial).write(inputData, len);
+
+  return inputData;
 }
 
-void handleCmd_Unkn(byte data[7])
+char *debugByte(uint8_t data)
 {
-  char hexstr[22];
-  for (int i = 0; i < 7; i++)
+  char *out = new char[sizeof(data)];
+  for (uint8_t pos = 0; pos < sizeof(data); pos++)
   {
-    sprintf(hexstr + i * 3, " %02x", data[i]);
+    out[pos] = (data & (1 << pos)) ? '0' : '1';
   }
-
-  (*usbSerial).print("Unknown:");
-  (*usbSerial).println(hexstr);
-}
-
-// Concept not working
-void sendCmd_00(uint16_t height)
-{
-  byte cmd[7] = {0x5a, 0x06, 00};
-  height = (height >> 8) | (height << 8);
-  memcpy(&cmd[3], &height, 2);
-
-  uint16_t chksum = cmd[1] + cmd[2] + cmd[3] + cmd[4];
-  chksum = (chksum >> 8) | (chksum << 8);
-  memcpy(&cmd[5], &chksum, 2);
-
-  for (int i = 0; i < 7; i++)
-  {
-    (*controllerSerial).write(cmd[i]);
-  }
-}
-
-void debugCommands()
-{
-  // loop as long as bytes are available
-  while ((*controllerSerial).available() > 0)
-  {
-    // circulate cmdBuffer and fill by reading a byte from serial
-    memmove(&cmdBuffer[0], &cmdBuffer[1], 6);
-    cmdBuffer[6] = (*controllerSerial).read();
-
-    // detect and handle start command
-    if ((cmdBuffer[0] == 0x5a && cmdBuffer[1] == 0x06))
-    {
-      switch (cmdBuffer[2])
-      {
-      case 0x00:
-        handleCmd_00(cmdBuffer);
-        break;
-
-      default:
-        handleCmd_Unkn(cmdBuffer);
-        break;
-      }
-    }
-  }
+  return out;
 }
 
 void setup()
 {
-  (*usbSerial).begin(usbBaud);
-  (*usbSerial).println("Start");
-  setControllerBaud(defaultControllerBaud);
+  // initialize GDB stub
+  debug_init();
 
-  // sendCmd_00(700);
+  initSerial(defaultControllerBaud);
 }
 
 void loop()
 {
-  // debugCommands();
+  int availInterfaceSerial = (*interfaceSerial).available();
+  int availControllerSerial1 = (*controllerSerial1).available();
+  // int availControllerSerial2 = (*controllerSerial2).available();
 
-  // check how many bytes are available in the serial ports
-  const int availControllerBytes = (*controllerSerial).available();
-  const int availInterfaceBytes = (*interfaceSerial).available();
+  /// controller 1 -> interface
+  uint8_t *controller1Data = forwardSerial(controllerSerial1, interfaceSerial, availControllerSerial1);
+  (*controllerSerial1).flush();
 
-  // read out the serial ports and write the data to the each other's serial port
-  byte controllerData[availControllerBytes];
-  byte interfaceData[availInterfaceBytes];
+  /// controller 2 -> interface
+  // uint8_t *controller2Data = forwardSerial(controllerSerial2, interfaceSerial);
 
-  if (availControllerBytes > 0)
-  {
+  /// interface -> controller 1
+  uint8_t *interfaceData = forwardSerial(interfaceSerial, controllerSerial1, availInterfaceSerial);
+  (*interfaceSerial).flush();
 
-    (*controllerSerial).readBytes(controllerData, availControllerBytes);
-    (*usbSerial).write(controllerData, availControllerBytes);
-    // (*interfaceSerial).write(controllerData, availControllerBytes);
-  }
-  if (availInterfaceBytes > 0)
-  {
-    (*interfaceSerial).readBytes(interfaceData, availInterfaceBytes);
-    // (*usbSerial).write(interfaceData, availInterfaceBytes);
-    // (*controllerSerial).write(interfaceData, availInterfaceBytes);
-  }
+  /// interface -> controller 2
+  // uint8_t *interfaceData = forwardSerial(interfaceSerial, controllerSerial2, availInterfaceSerial);
 }
