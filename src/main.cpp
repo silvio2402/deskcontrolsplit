@@ -1,163 +1,192 @@
 #include <Arduino.h>
-#include "avr8-stub.h"
-#include "app_api.h" // only needed with flash breakpoints
+#include <math.h>
 
-const unsigned long defaultControllerBaud = 9600;
+#include "app_api.h"  // only needed with flash breakpoints
+#include "avr8-stub.h"
 
 HardwareSerial *interfaceSerial = &Serial1;
 HardwareSerial *controllerSerial1 = &Serial2;
 HardwareSerial *controllerSerial2 = &Serial3;
 
-// Protocol
-const uint8_t PROT_SER_INT = B00000001;
-const uint8_t PROT_SER_CTRL1 = B00000010;
-const uint8_t PROT_SER_CTRL2 = B00000011;
-const uint8_t PROT_SER_MASK_CTRL = B00000010;
-const uint8_t PROT_SER_INT_LEN = 5;
+unsigned long int startTime;
+unsigned long elapsedTime;
 
-const uint8_t PROT_START = 0xA5;
-const uint8_t PROT_CMD_CTRL_STATE = 0x00;
-const uint8_t PROT_CMD_CTRL_STATE_M = 0x01;
-const uint8_t PROT_CMD_CTRL_STATE_1 = 0x02;
-const uint8_t PROT_CMD_CTRL_STATE_2 = 0x04;
-const uint8_t PROT_CMD_CTRL_STATE_3 = 0x08;
-const uint8_t PROT_CMD_CTRL_STATE_T = 0x10;
-const uint8_t PROT_CMD_CTRL_STATE_UP = 0x20;
-const uint8_t PROT_CMD_CTRL_STATE_DW = 0x40;
+const double defaultUserSetSpeed = 0.0001;
+const double snapUserSetSpeedThr = 0.0004;
+const double maxUserSetSpeed = 0.001;
+const double userSetSpeedMultiplier = 0.001;
+const unsigned long buttonHoldThr = 500000;
+const unsigned int minHeight = 620;
+const int maxHeight = 1280;
 
-void initSerial(unsigned long newControllerBaud)
-{
-  (*controllerSerial1).end();
-  (*controllerSerial2).end();
-  (*interfaceSerial).end();
+double userSetHeight = 620;
+double userSetSpeed = 0.0001;
 
-  (*controllerSerial1).begin(newControllerBaud);
-  (*controllerSerial2).begin(newControllerBaud);
-  (*interfaceSerial).begin(newControllerBaud);
+unsigned long prevStateTime;
+uint8_t prevState;
+
+uint8_t SEG7_MAP[36] = {B00111111, B00000110, B01011011, B01001111, B01100110, B01101101, B01111101, B00000111,
+                        B01111111, B01101111, B01011111, B01111100, B01011000, B01011110, B01011110, B01110001,
+                        B00111101, B01110100, B00010001, B00001101, B01110101, B00111001, B01010101, B01010100,
+                        B01011100, B01110011, B01100111, B01010000, B00101101, B01111000, B00011100, B00101010,
+                        B01101010, B00010100, B01101110, B00011011};
+
+double bound(double value, double min, double max) {
+  if (value >= min && value <= max)
+    return value;
+  else if (value < min)
+    return min;
+  else if (value > max)
+    return max;
+  return min;
 }
 
-HardwareSerial *getSerial(uint8_t which)
-{
-  switch (which)
-  {
-  case PROT_SER_INT:
-    return interfaceSerial;
-    break;
+void initSerial(unsigned long newControllerBaud) {
+  // controllerSerial1->end();
+  // controllerSerial2->end();
+  // interfaceSerial->end();
 
-  case PROT_SER_CTRL1:
-    return controllerSerial1;
-    break;
-
-  case PROT_SER_CTRL2:
-    return controllerSerial2;
-    break;
-
-  default:
-    return nullptr;
-    break;
-  }
+  // controllerSerial1->begin(newControllerBaud);
+  // controllerSerial2->begin(newControllerBaud);
+  interfaceSerial->begin(newControllerBaud);
 }
 
-bool isCtrlSerial(uint8_t which)
-{
-  return ((which & PROT_SER_MASK_CTRL) > 0);
-}
-
-void sendCmd(uint8_t to, uint8_t *cmdBytes, uint8_t cmdLen)
-{
-  HardwareSerial *outputSerial = getSerial(to);
-  (*outputSerial).write(cmdBytes, cmdLen);
-  (*outputSerial).flush();
-}
-
-void handleCtrlCmd00(uint8_t *cmdBytes, uint8_t cmdLen)
-{
-  if (cmdLen != 5)
-    return;
-  uint8_t state = cmdBytes[2];
-  bool pressedM = state & PROT_CMD_CTRL_STATE_M > 0;
-  bool pressed1 = state & PROT_CMD_CTRL_STATE_1 > 0;
-  bool pressed2 = state & PROT_CMD_CTRL_STATE_2 > 0;
-  bool pressed3 = state & PROT_CMD_CTRL_STATE_3 > 0;
-  bool pressedT = state & PROT_CMD_CTRL_STATE_T > 0;
-  bool pressedUP = state & PROT_CMD_CTRL_STATE_UP > 0;
-  bool pressedDW = state & PROT_CMD_CTRL_STATE_DW > 0;
-}
-
-bool checkSum(uint8_t *cmdBytes, uint8_t cmdLen)
-{
-  uint16_t sum = 0;
-  for (int i = 1; i < cmdLen - 1; i++)
-    sum += cmdBytes[i];
+uint8_t calcChecksum(uint8_t *cmdBytes, unsigned int cmdLen) {
+  unsigned int sum = 0;
+  for (unsigned int i = 1; i < cmdLen - 1; i++) sum += cmdBytes[i];
   return (sum % (0xFF + 1));
 }
 
-void sendCtrlCmd00(uint8_t to, bool pressedM, bool pressed1, bool pressed2, bool pressed3, bool pressedT, bool pressedUP, bool pressedDW)
-{
-  uint8_t state = 0;
-  if (pressedM)
-    state += PROT_CMD_CTRL_STATE_M;
-  if (pressed1)
-    state += PROT_CMD_CTRL_STATE_1;
-  if (pressed2)
-    state += PROT_CMD_CTRL_STATE_2;
-  if (pressed3)
-    state += PROT_CMD_CTRL_STATE_3;
-  if (pressedT)
-    state += PROT_CMD_CTRL_STATE_T;
-  if (pressedUP)
-    state += PROT_CMD_CTRL_STATE_UP;
-  if (pressedDW)
-    state += PROT_CMD_CTRL_STATE_DW;
+void sendToDisplay(uint8_t digit0, uint8_t digit1, uint8_t digit2) {
+  // uint8_t cmdBytes[6] = {0x5A, digit0, digit1, digit2, 0x10, 0x00};
 
-  uint8_t cmdBytes[5] = {PROT_START, PROT_CMD_CTRL_STATE, state, 0x01};
-  cmdBytes[4] = checkSum(cmdBytes, 5);
-  sendCmd(to, cmdBytes, 5);
+  uint8_t cmdBytes[6] = {0};
+  cmdBytes[0] = 0x5A;
+  cmdBytes[1] = digit0;
+  cmdBytes[2] = digit1;
+  cmdBytes[3] = digit2;
+  cmdBytes[4] = 0x10;
+  cmdBytes[5] = calcChecksum(cmdBytes, 6);
+
+  interfaceSerial->write(cmdBytes, 6);
 }
 
-void handleCmd(uint8_t from, uint8_t *cmdBytes, uint8_t cmdLen)
-{
-  switch (cmdBytes[1])
-  {
-  case PROT_CMD_CTRL_STATE:
-    break;
-
-  default:
-    break;
-  }
-}
-
-void receiveCmd(uint8_t from, uint8_t cmdLen)
-{
-  HardwareSerial *inputSerial = getSerial(from);
-  while ((*inputSerial).available() > 0)
-  {
-    uint8_t byte = (*inputSerial).peek();
-    if (byte != PROT_START)
-    {
-      (*inputSerial).read();
+void checkInterfaceData() {
+  while (interfaceSerial->available() > 0) {
+    uint8_t byte = interfaceSerial->peek();
+    if (byte != 0xA5) {
+      interfaceSerial->read();
       continue;
     }
 
-    uint8_t *cmdBytes = new uint8_t[cmdLen];
-    (*inputSerial).readBytes(cmdBytes, cmdLen);
-    if (cmdBytes[cmdLen - 1] == checkSum(cmdBytes, cmdLen))
-      handleCmd(from, cmdBytes, cmdLen);
+    uint8_t cmdBytes[5];
+    interfaceSerial->readBytes(cmdBytes, 5);
+    if (cmdBytes[4] == calcChecksum(cmdBytes, 5)) {
+      // bool prevOnlyPressedM = ((prevState & B00000001) > 0 && (prevState & B11111110) == 0);
+      // bool prevOnlyPressed1 = ((prevState & B00000010) > 0 && (prevState & B11111101) == 0);
+      // bool prevOnlyPressed2 = ((prevState & B00000100) > 0 && (prevState & B11111011) == 0);
+      // bool prevOnlyPressed3 = ((prevState & B00001000) > 0 && (prevState & B11110111) == 0);
+      // bool prevOnlyPressedT = ((prevState & B00010000) > 0 && (prevState & B11101111) == 0);
+      bool prevOnlyPressedUP = ((prevState & B00100000) > 0 && (prevState & B11011111) == 0);
+      bool prevOnlyPressedDW = ((prevState & B01000000) > 0 && (prevState & B10111111) == 0);
+
+      uint8_t state = cmdBytes[2];
+      // bool onlyPressedM = ((state & B00000001) > 0 && (state & B11111110) == 0);
+      // bool onlyPressed1 = ((state & B00000010) > 0 && (state & B11111101) == 0);
+      // bool onlyPressed2 = ((state & B00000100) > 0 && (state & B11111011) == 0);
+      // bool onlyPressed3 = ((state & B00001000) > 0 && (state & B11110111) == 0);
+      // bool onlyPressedT = ((state & B00010000) > 0 && (state & B11101111) == 0);
+      bool onlyPressedUP = ((state & B00100000) > 0 && (state & B11011111) == 0);
+      bool onlyPressedDW = ((state & B01000000) > 0 && (state & B10111111) == 0);
+
+      if (prevState != state) prevStateTime = startTime;
+
+      unsigned long sameStateFor = startTime - prevStateTime;
+
+      if (onlyPressedUP) {
+        if (prevOnlyPressedUP) {
+          // Update
+          if (sameStateFor >= buttonHoldThr) {
+            userSetSpeed = bound(userSetSpeed * userSetSpeedMultiplier * (double)elapsedTime, defaultUserSetSpeed,
+                                 maxUserSetSpeed);
+            userSetHeight = bound(userSetHeight + userSetSpeed * (double)elapsedTime, minHeight, maxHeight);
+          }
+        } else {
+          // Pressed
+          userSetHeight = bound(userSetHeight + 1, minHeight, maxHeight);
+        }
+      } else if (prevOnlyPressedUP) {
+        // Released
+        if (userSetSpeed >= snapUserSetSpeedThr) {
+          // Snap to 10mm
+          userSetHeight = bound(ceil(userSetHeight / 10) * 10, minHeight, maxHeight);
+        }
+        userSetSpeed = defaultUserSetSpeed;
+      }
+
+      if (onlyPressedDW) {
+        if (prevOnlyPressedDW) {
+          // Update
+          if (sameStateFor >= buttonHoldThr) {
+            userSetSpeed = bound(userSetSpeed * userSetSpeedMultiplier * (double)elapsedTime, defaultUserSetSpeed,
+                                 maxUserSetSpeed);
+            userSetHeight = bound(userSetHeight - userSetSpeed * (double)elapsedTime, minHeight, maxHeight);
+          }
+        } else {
+          // Pressed
+          userSetHeight = bound(userSetHeight - 1, minHeight, maxHeight);
+        }
+      } else if (prevOnlyPressedDW) {
+        // Released
+        if (userSetSpeed >= snapUserSetSpeedThr) {
+          // Snap to 10mm
+          userSetHeight = floor(userSetHeight / 10) * 10;
+        }
+        userSetSpeed = defaultUserSetSpeed;
+      }
+
+      uint8_t digit0;
+      uint8_t digit1;
+      uint8_t digit2;
+
+      if (userSetHeight >= 1000) {
+        digit0 = SEG7_MAP[(int)floor(userSetHeight / 1000) % 10];
+        digit1 = SEG7_MAP[(int)floor(userSetHeight / 100) % 10];
+        digit2 = SEG7_MAP[(int)floor(userSetHeight / 10) % 10];
+      } else {
+        digit0 = SEG7_MAP[(int)floor(userSetHeight / 100) % 10];
+        digit1 = SEG7_MAP[(int)floor(userSetHeight / 10) % 10];
+        digit1 = (digit1 & B01111111) + B10000000;
+        digit2 = SEG7_MAP[(int)userSetHeight % 10];
+      }
+
+      // digit0 = B10101010;
+      // digit1 = B01010101;
+      // digit2 = B11001100;
+
+      sendToDisplay(digit0, digit1, digit2);
+
+      prevState = state;
+    }
   }
 }
 
-void setup()
-{
+void setup() {
   // initialize GDB stub
-  debug_init();
+  // debug_init();
 
-  initSerial(defaultControllerBaud);
+  // Serial.begin(115200);
+  // Serial.println("Start");
+
+  initSerial(9600);
 }
 
-void loop()
-{
-  // receiveCmd(PROT_SER_INT, PROT_SER_INT_LEN);
+void loop() {
+  elapsedTime = micros() - startTime;
+  startTime = micros();
 
-  sendCtrlCmd00(PROT_SER_CTRL1, 0, 0, 0, 0, 0, 0, 0);
-  delay(100);
+  int av = interfaceSerial->available();
+  if (av > 0) checkInterfaceData();
+
+  delay(1);
 }
