@@ -1,0 +1,329 @@
+#include <Arduino.h>
+
+#include "app_api.h"  // only needed with flash breakpoints
+#include "avr8-stub.h"
+
+const unsigned long defaultControllerBaud = 9600;
+
+HardwareSerial *interfaceSerial = &Serial1;
+HardwareSerial *controllerSerial1 = &Serial2;
+HardwareSerial *controllerSerial2 = &Serial3;
+
+bool selfTestMode;
+
+// Protocol
+const uint8_t PROT_SER_INT = B00000001;
+const uint8_t PROT_SER_CTRL1 = B00000010;
+const uint8_t PROT_SER_CTRL2 = B00000011;
+const uint8_t PROT_SER_MASK_CTRL = B00000010;
+const uint8_t PROT_SER_INT_LEN = 5;
+const uint8_t PROT_SER_CTRL_LEN = 6;
+
+// CTRL -> INT
+const uint8_t PROT_INT_START = 0x5A;
+const uint8_t PROT_CMD_INT_DISPLAY = 0x10;
+
+// INT -> CTRL
+const uint8_t PROT_CTRL_START = 0xA5;
+const uint8_t PROT_CMD_CTRL_BUTTONS = 0x01;
+const uint8_t PROT_CMD_CTRL_BUTTON_M = 0x01;
+const uint8_t PROT_CMD_CTRL_BUTTON_1 = 0x02;
+const uint8_t PROT_CMD_CTRL_BUTTON_2 = 0x04;
+const uint8_t PROT_CMD_CTRL_BUTTON_3 = 0x08;
+const uint8_t PROT_CMD_CTRL_BUTTON_T = 0x10;
+const uint8_t PROT_CMD_CTRL_BUTTON_UP = 0x20;
+const uint8_t PROT_CMD_CTRL_BUTTON_DW = 0x40;
+
+void initSerial(unsigned long newControllerBaud) {
+  (*controllerSerial1).end();
+  (*controllerSerial2).end();
+  (*interfaceSerial).end();
+
+  (*controllerSerial1).begin(newControllerBaud);
+  (*controllerSerial2).begin(newControllerBaud);
+  (*interfaceSerial).begin(newControllerBaud);
+}
+
+HardwareSerial *getSerial(uint8_t which) {
+  switch (which) {
+    case PROT_SER_INT:
+      return interfaceSerial;
+      break;
+
+    case PROT_SER_CTRL1:
+      return controllerSerial1;
+      break;
+
+    case PROT_SER_CTRL2:
+      return controllerSerial2;
+      break;
+
+    default:
+      return nullptr;
+      break;
+  }
+}
+
+bool isCtrlSerial(uint8_t which) { return ((which & PROT_SER_MASK_CTRL) > 0); }
+
+uint8_t checkSum(uint8_t *cmdBytes, uint8_t cmdLen) {
+  uint16_t sum = 0;
+  for (int i = 1; i < cmdLen - 1; i++) sum += cmdBytes[i];
+  return (sum % (0xFF + 1));
+}
+
+void sendCmd(uint8_t to, uint8_t *cmdBytes, uint8_t cmdLen) {
+  HardwareSerial *outputSerial = getSerial(to);
+  (*outputSerial).write(cmdBytes, cmdLen);
+  (*outputSerial).flush();
+}
+
+// Parameter structs
+
+struct intButtons {
+  bool pressedM;
+  bool pressed1;
+  bool pressed2;
+  bool pressed3;
+  bool pressedT;
+  bool pressedUP;
+  bool pressedDW;
+};
+
+const intButtons intButtonsEmpty = {};
+
+intButtons intButtonStates;
+
+struct intDigits {
+  uint8_t digit0 = B11111111;
+  uint8_t digit1 = B11111111;
+  uint8_t digit2 = B11111111;
+};
+
+const intDigits intDigitsEmpty;
+
+intDigits ctrl1DigitStates;
+intDigits ctrl2DigitStates;
+
+// Send commands
+
+void sendCtrlCmd01(uint8_t to, intButtons buttonStates) {
+  uint8_t state = 0;
+  if (buttonStates.pressedM) state += PROT_CMD_CTRL_BUTTON_M;
+  if (buttonStates.pressed1) state += PROT_CMD_CTRL_BUTTON_1;
+  if (buttonStates.pressed2) state += PROT_CMD_CTRL_BUTTON_2;
+  if (buttonStates.pressed3) state += PROT_CMD_CTRL_BUTTON_3;
+  if (buttonStates.pressedT) state += PROT_CMD_CTRL_BUTTON_T;
+  if (buttonStates.pressedUP) state += PROT_CMD_CTRL_BUTTON_UP;
+  if (buttonStates.pressedDW) state += PROT_CMD_CTRL_BUTTON_DW;
+
+  uint8_t cmdBytes[5] = {PROT_CTRL_START, 0x00, state, PROT_CMD_CTRL_BUTTONS};
+  cmdBytes[4] = checkSum(cmdBytes, 5);
+  sendCmd(to, cmdBytes, 5);
+}
+
+void sendIntCmd10(uint8_t to, intDigits digitStates) {
+  uint8_t cmdBytes[6] = {PROT_INT_START, digitStates.digit0, digitStates.digit1, digitStates.digit2,
+                         PROT_CMD_INT_DISPLAY};
+  cmdBytes[5] = checkSum(cmdBytes, 6);
+  sendCmd(to, cmdBytes, 6);
+}
+
+// Handle commands
+
+intButtons handleCtrlCmd01(uint8_t from, uint8_t *cmdBytes, uint8_t cmdLen) {
+  uint8_t state = cmdBytes[2];
+  intButtons buttonStates;
+  buttonStates.pressedM = ((state & PROT_CMD_CTRL_BUTTON_M) > 0);
+  buttonStates.pressed1 = ((state & PROT_CMD_CTRL_BUTTON_1) > 0);
+  buttonStates.pressed2 = ((state & PROT_CMD_CTRL_BUTTON_2) > 0);
+  buttonStates.pressed3 = ((state & PROT_CMD_CTRL_BUTTON_3) > 0);
+  buttonStates.pressedT = ((state & PROT_CMD_CTRL_BUTTON_T) > 0);
+  buttonStates.pressedUP = ((state & PROT_CMD_CTRL_BUTTON_UP) > 0);
+  buttonStates.pressedDW = ((state & PROT_CMD_CTRL_BUTTON_DW) > 0);
+  intButtonStates = buttonStates;
+}
+
+intDigits handleIntCmd10(uint8_t from, uint8_t *cmdBytes, uint8_t cmdLen) {
+  intDigits digitStates;
+  digitStates.digit0 = cmdBytes[1];
+  digitStates.digit1 = cmdBytes[2];
+  digitStates.digit2 = cmdBytes[3];
+
+  if (from == PROT_SER_CTRL1)
+    ctrl1DigitStates = digitStates;
+  else if (from == PROT_SER_CTRL2)
+    ctrl2DigitStates = digitStates;
+}
+
+void handleCmd(uint8_t from, uint8_t *cmdBytes, uint8_t cmdLen) {
+  if (isCtrlSerial(from)) {
+    switch (cmdBytes[4]) {
+      case PROT_CMD_INT_DISPLAY:
+        handleIntCmd10(from, cmdBytes, cmdLen);
+        break;
+
+      default:
+        break;
+    }
+  } else {
+    switch (cmdBytes[3]) {
+      case PROT_CMD_CTRL_BUTTONS:
+        handleCtrlCmd01(from, cmdBytes, cmdLen);
+        break;
+
+      default:
+        break;
+    }
+  }
+}
+
+bool receiveCmd(uint8_t from, uint8_t cmdLen) {
+  HardwareSerial *inputSerial = getSerial(from);
+  while ((*inputSerial).available() > 0) {
+    uint8_t byte = (*inputSerial).peek();
+    if (byte != (isCtrlSerial(from) ? PROT_INT_START : PROT_CTRL_START)) {
+      (*inputSerial).read();
+      continue;
+    }
+
+    uint8_t cmdBytes[cmdLen];
+    (*inputSerial).readBytes(cmdBytes, cmdLen);
+    if (cmdBytes[cmdLen - 1] == checkSum(cmdBytes, cmdLen)) {
+      handleCmd(from, cmdBytes, cmdLen);
+      return true;
+    }
+  }
+  return false;
+}
+
+char SEG7_MAP[36] = {B00111111, B00000110, B01011011, B01001111, B01100110, B01101101, B01111101, B00000111, B01111111,
+                     B01101111, B01011111, B01111100, B01011000, B01011110, B01011110, B01110001, B00111101, B01110100,
+                     B00010001, B00001101, B01110101, B00111001, B01010101, B01010100, B01011100, B01110011, B01100111,
+                     B01010000, B00101101, B01111000, B00011100, B00101010, B01101010, B00010100, B01101110, B00011011};
+
+uint8_t extractDigit(uint8_t digit, bool alphaNumeric = false) {
+  uint8_t max = alphaNumeric ? 36 : 10;
+  for (int i = 0; i < max; i++)
+    if ((digit & B01111111) == SEG7_MAP[i]) return i;
+
+  return -1;
+}
+
+int extractHeight(intDigits digitStates) {
+  // Check if dot is set
+  if (!((digitStates.digit1 & B10000000) > 0)) return -1;
+
+  uint8_t digit0Value = extractDigit(digitStates.digit0);
+  if (digit0Value < 0) return -1;
+  uint8_t digit1Value = extractDigit(digitStates.digit1);
+  if (digit1Value < 0) return -1;
+  uint8_t digit2Value = extractDigit(digitStates.digit2);
+  if (digit2Value < 0) return -1;
+
+  return digit0Value * 100 + digit1Value * 10 + digit2Value;
+}
+
+void clearSerialBuffer(uint8_t of) {
+  HardwareSerial *inputSerial = getSerial(of);
+  int av = (*inputSerial).available();
+  while (av > 0) {
+    uint8_t buf[av];
+    (*inputSerial).readBytes(buf, av);
+    av = (*inputSerial).available();
+  }
+}
+
+uint8_t digitToSeg(char ch) {
+  if (ch >= '0' && ch <= '9') return SEG7_MAP[ch - '0'];
+  if (ch >= 'A' && ch <= 'Z') return SEG7_MAP[ch - 'A' + 10];
+  if (ch >= 'a' && ch <= 'Z') return SEG7_MAP[ch - 'a' + 10];
+  return 0;
+}
+
+void display(char *msg, uint8_t msgLen) {
+  char digitsOut[3];
+  uint8_t digitIndex;
+
+  for (uint8_t charIndex; charIndex < msgLen; charIndex++) {
+    char currChar = msg[charIndex];
+    digitsOut[digitIndex] = digitToSeg(currChar);
+    if (currChar == '.') {
+      digitsOut[digitIndex] = (digitsOut[digitIndex] & B01111111) + B10000000;
+      digitIndex++;
+    } else if (charIndex + 1 < msgLen && msg[charIndex + 1] != '.')
+      digitIndex++;
+
+    charIndex++;
+  }
+
+  uint16_t counter;
+  clearSerialBuffer(PROT_SER_INT);
+  while (receiveCmd(PROT_SER_INT, PROT_SER_INT_LEN)) {
+    counter++;
+    if (counter >= 1000) return;
+  }
+
+  intDigits digitStates;
+  digitStates.digit0 = digitsOut[0];
+  digitStates.digit1 = digitsOut[1];
+  digitStates.digit2 = digitsOut[2];
+  sendIntCmd10(PROT_SER_INT, digitStates);
+}
+
+void selfTestFail() {
+  char msg[3] = {'E', 'r', 'r'};
+  while (1) display(msg, 3);
+}
+
+void selfTest() {
+  selfTestMode = true;
+
+  char msgS[1] = {'S'};
+  display(msgS, 1);
+
+  // Controller 1
+  clearSerialBuffer(PROT_SER_CTRL1);
+  sendCtrlCmd01(PROT_SER_CTRL1, {false, false, false, false, false, false, false});
+  ctrl1DigitStates = intDigitsEmpty;
+  int height = -1;
+  uint16_t counter;
+  while (height == -1) {
+    receiveCmd(PROT_SER_CTRL1, PROT_SER_CTRL_LEN);
+    height = extractHeight(ctrl1DigitStates);
+    counter++;
+    if (counter >= 1000) {
+      selfTestFail();
+      break;
+    }
+  }
+
+  char msgOk[3] = {'O', 'k', '.'};
+  display(msgOk, 3);
+
+  selfTestMode = false;
+}
+
+void setup() {
+  // initialize GDB stub
+  debug_init();
+
+  initSerial(defaultControllerBaud);
+
+  char msgS[1] = {'S'};
+  display(msgS, 1);
+
+  // selfTest();
+
+  sendCtrlCmd01(PROT_SER_CTRL1, {false, false, false, false, false, false, false});
+}
+
+void loop() {
+  receiveCmd(PROT_SER_INT, PROT_SER_INT_LEN);
+  // receiveCmd(PROT_SER_CTRL1, PROT_SER_CTRL_LEN);
+
+  // delay(10);
+
+  // sendCtrlCmd01(PROT_SER_CTRL1, false, false, false, false, false, counter % 200 < 50, counter % 200 > 120);
+  // sendCtrlCmd01(PROT_SER_CTRL1, false, false, false, false, false, true, true);
+}
