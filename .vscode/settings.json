@@ -1,4 +1,7 @@
 {
   "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: Google }",
-  "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, ColumnLimit: 120 }"
+  "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, ColumnLimit: 120 }",
+  "files.associations": {
+    "*.old": "cpp"
+  }
 }
